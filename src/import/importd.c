@@ -22,6 +22,7 @@
 #include "parse-util.h"
 #include "path-util.h"
 #include "process-util.h"
+#include "sd-path.h"
 #include "service-util.h"
 #include "signal-util.h"
 #include "socket-util.h"
@@ -93,6 +94,7 @@ struct Manager {
         int notify_fd;
 
         sd_event_source *notify_event_source;
+        bool is_system;
 };
 
 #define TRANSFERS_MAX 64
@@ -108,6 +110,8 @@ static const char* const transfer_type_table[_TRANSFER_TYPE_MAX] = {
 };
 
 DEFINE_PRIVATE_STRING_TABLE_LOOKUP_TO_STRING(transfer_type, TransferType);
+
+static bool arg_user = false;
 
 static Transfer *transfer_unref(Transfer *t) {
         if (!t)
@@ -359,6 +363,18 @@ static int transfer_on_log(sd_event_source *s, int fd, uint32_t revents, void *u
         return 0;
 }
 
+static char *notify_path(bool system) {
+        char *path;
+
+        if (system)
+                return strdup("/run/systemd/import/notify");
+
+        if (sd_path_lookup(SD_PATH_USER_RUNTIME, "systemd/import/notify", &path) < 0)
+                return NULL;
+
+        return path;
+}
+
 static int transfer_start(Transfer *t) {
         _cleanup_close_pair_ int pipefd[2] = { -1, -1 };
         int r;
@@ -383,11 +399,14 @@ static int transfer_start(Transfer *t) {
                         NULL, /* if so: the actual URL */
                         NULL, /* maybe --format= */
                         NULL, /* if so: the actual format */
+                        NULL, /* maybe --image-root= */
+                        NULL, /* if so: image-root PATH */
                         NULL, /* remote */
                         NULL, /* local */
                         NULL
                 };
                 unsigned k = 0;
+                _cleanup_free_ char *notify_socket = notify_path(t->manager->is_system);
 
                 /* Child */
 
@@ -402,7 +421,7 @@ static int transfer_start(Transfer *t) {
                 }
 
                 if (setenv("SYSTEMD_LOG_TARGET", "console-prefixed", 1) < 0 ||
-                    setenv("NOTIFY_SOCKET", "/run/systemd/import/notify", 1) < 0) {
+                    setenv("NOTIFY_SOCKET", notify_socket, 1) < 0) {
                         log_error_errno(errno, "setenv() failed: %m");
                         _exit(EXIT_FAILURE);
                 }
@@ -467,6 +486,11 @@ static int transfer_start(Transfer *t) {
                 if (t->format) {
                         cmd[k++] = "--format";
                         cmd[k++] = t->format;
+                }
+
+                if (!t->manager->is_system) {
+                        cmd[k++] = "--image-root";
+                        cmd[k++] = machines_path(t->manager->is_system);
                 }
 
                 if (!IN_SET(t->type, TRANSFER_EXPORT_TAR, TRANSFER_EXPORT_RAW)) {
@@ -619,15 +643,24 @@ static int manager_on_notify(sd_event_source *s, int fd, uint32_t revents, void 
         return 0;
 }
 
-static int manager_new(Manager **ret) {
+static int manager_new(Manager **ret, bool is_system) {
         _cleanup_(manager_unrefp) Manager *m = NULL;
-        static const union sockaddr_union sa = {
+        _cleanup_free_ char *path = NULL;
+        union sockaddr_union sa = {
                 .un.sun_family = AF_UNIX,
-                .un.sun_path = "/run/systemd/import/notify",
         };
         int r;
 
         assert(ret);
+
+        path = notify_path(true);
+        if (!path)
+                return -ENOMEM;
+
+        if (strlen(path) >= sizeof(sa.un.sun_path))
+                return -EINVAL;
+
+        memcpy(sa.un.sun_path, path, strlen(path) + 1);
 
         m = new0(Manager, 1);
         if (!m)
@@ -639,7 +672,11 @@ static int manager_new(Manager **ret) {
 
         sd_event_set_watchdog(m->event, true);
 
-        r = sd_bus_default_system(&m->bus);
+        m->is_system = is_system;
+        if (is_system)
+                r = sd_bus_default_system(&m->bus);
+        else
+                r = sd_bus_default_user(&m->bus);
         if (r < 0)
                 return r;
 
@@ -721,7 +758,7 @@ static int method_import_tar_or_raw(sd_bus_message *msg, void *userdata, sd_bus_
                 return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS,
                                          "Local name %s is invalid", local);
 
-        r = setup_machine_directory(error);
+        r = setup_machine_directory(m->is_system, error);
         if (r < 0)
                 return r;
 
@@ -791,7 +828,7 @@ static int method_import_fs(sd_bus_message *msg, void *userdata, sd_bus_error *e
                 return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS,
                                          "Local name %s is invalid", local);
 
-        r = setup_machine_directory(error);
+        r = setup_machine_directory(m->is_system, error);
         if (r < 0)
                 return r;
 
@@ -944,7 +981,7 @@ static int method_pull_tar_or_raw(sd_bus_message *msg, void *userdata, sd_bus_er
                 return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS,
                                          "Unknown verification mode %s", verify);
 
-        r = setup_machine_directory(error);
+        r = setup_machine_directory(m->is_system, error);
         if (r < 0)
                 return r;
 
@@ -1371,7 +1408,7 @@ static int run(int argc, char *argv[]) {
                                "VM and container image import and export service.",
                                BUS_IMPLEMENTATIONS(&manager_object,
                                                    &log_control_object),
-                               argc, argv);
+                               argc, argv, &arg_user);
         if (r <= 0)
                 return r;
 
@@ -1379,7 +1416,7 @@ static int run(int argc, char *argv[]) {
 
         assert_se(sigprocmask_many(SIG_BLOCK, NULL, SIGCHLD, -1) >= 0);
 
-        r = manager_new(&m);
+        r = manager_new(&m, !arg_user);
         if (r < 0)
                 return log_error_errno(r, "Failed to allocate manager object: %m");
 

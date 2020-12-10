@@ -20,6 +20,7 @@ struct Manager {
         sd_event *event;
         sd_bus *bus;
 
+        char *run_path;
         Hashmap *machines;
         Hashmap *machine_units;
         Hashmap *machine_leaders;
@@ -41,6 +42,7 @@ struct Manager {
 #endif
 
         VarlinkServer *varlink_server;
+        bool is_system;
 };
 
 int manager_add_machine(Manager *m, const char *name, Machine **_machine);

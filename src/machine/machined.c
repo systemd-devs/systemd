@@ -23,6 +23,7 @@
 #include "machined-varlink.h"
 #include "machined.h"
 #include "main-func.h"
+#include "path-lookup.h"
 #include "process-util.h"
 #include "service-util.h"
 #include "signal-util.h"
@@ -33,7 +34,9 @@ DEFINE_TRIVIAL_CLEANUP_FUNC(Manager*, manager_unref);
 
 DEFINE_PRIVATE_HASH_OPS_WITH_VALUE_DESTRUCTOR(machine_hash_ops, char, string_hash_func, string_compare_func, Machine, machine_free);
 
-static int manager_new(Manager **ret) {
+static bool arg_user = false;
+
+static int manager_new(Manager **ret, bool is_system) {
         _cleanup_(manager_unrefp) Manager *m = NULL;
         int r;
 
@@ -43,11 +46,20 @@ static int manager_new(Manager **ret) {
         if (!m)
                 return -ENOMEM;
 
+        m->is_system = is_system;
+        if (m->is_system)
+                m->run_path = strdup("/run/systemd/machines");
+        else {
+                r = xdg_user_runtime_dir(&m->run_path, "/systemd/machines");
+                if (r < 0)
+                        return r;
+        }
+
         m->machines = hashmap_new(&machine_hash_ops);
         m->machine_units = hashmap_new(&string_hash_ops);
         m->machine_leaders = hashmap_new(NULL);
 
-        if (!m->machines || !m->machine_units || !m->machine_leaders)
+        if (!m->run_path || !m->machines || !m->machine_units || !m->machine_leaders)
                 return -ENOMEM;
 
         r = sd_event_default(&m->event);
@@ -77,6 +89,7 @@ static Manager* manager_unref(Manager *m) {
 
         assert(m->n_operations == 0);
 
+        free(m->run_path);
         hashmap_free(m->machines); /* This will free all machines, so that the machine_units/machine_leaders is empty */
         hashmap_free(m->machine_units);
         hashmap_free(m->machine_leaders);
@@ -147,12 +160,12 @@ static int manager_enumerate_machines(Manager *m) {
                 return r;
 
         /* Read in machine data stored on disk */
-        d = opendir("/run/systemd/machines");
+        d = opendir(m->run_path);
         if (!d) {
                 if (errno == ENOENT)
                         return 0;
 
-                return log_error_errno(errno, "Failed to open /run/systemd/machines: %m");
+                return log_error_errno(errno, "Failed to open %s: %m", m->run_path);
         }
 
         FOREACH_DIRENT(de, d, return -errno) {
@@ -191,9 +204,12 @@ static int manager_connect_bus(Manager *m) {
         assert(m);
         assert(!m->bus);
 
-        r = sd_bus_default_system(&m->bus);
+        if (m->is_system)
+                r = sd_bus_default_system(&m->bus);
+        else
+                r = sd_bus_default_user(&m->bus);
         if (r < 0)
-                return log_error_errno(r, "Failed to connect to system bus: %m");
+                return log_error_errno(r, "Failed to connect to bus: %m");
 
         r = bus_add_implementation(m->bus, &manager_object, m);
         if (r < 0)
@@ -277,9 +293,11 @@ static int manager_startup(Manager *m) {
                 return r;
 
         /* Set up Varlink service */
-        r = manager_varlink_init(m);
-        if (r < 0)
-                return r;
+        if (!arg_user) {
+                r = manager_varlink_init(m);
+                if (r < 0)
+                        return r;
+        }
 
         /* Deserialize state */
         manager_enumerate_machines(m);
@@ -300,7 +318,7 @@ static bool check_idle(void *userdata) {
         if (m->operations)
                 return false;
 
-        if (varlink_server_current_connections(m->varlink_server) > 0)
+        if (m->varlink_server && varlink_server_current_connections(m->varlink_server) > 0)
                 return false;
 
         manager_gc(m, true);
@@ -330,22 +348,22 @@ static int run(int argc, char *argv[]) {
                                "Manage registrations of local VMs and containers.",
                                BUS_IMPLEMENTATIONS(&manager_object,
                                                    &log_control_object),
-                               argc, argv);
+                               argc, argv, &arg_user);
         if (r <= 0)
                 return r;
 
         umask(0022);
 
-        /* Always create the directories people can create inotify watches in. Note that some applications might check
-         * for the existence of /run/systemd/machines/ to determine whether machined is available, so please always
-         * make sure this check stays in. */
-        (void) mkdir_label("/run/systemd/machines", 0755);
-
         assert_se(sigprocmask_many(SIG_BLOCK, NULL, SIGCHLD, SIGTERM, SIGINT, -1) >= 0);
 
-        r = manager_new(&m);
+        r = manager_new(&m, !arg_user);
         if (r < 0)
                 return log_error_errno(r, "Failed to allocate manager object: %m");
+
+        /* Always create the directories people can create inotify watches in. Note that some applications might check
+         * for the existence of $run/systemd/machines/ to determine whether machined is available, so please always
+         * make sure this check stays in. */
+        (void) mkdir_label(m->run_path, 0755);
 
         r = manager_startup(m);
         if (r < 0)

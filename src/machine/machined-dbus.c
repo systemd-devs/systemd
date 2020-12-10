@@ -32,7 +32,28 @@
 #include "unit-name.h"
 #include "user-util.h"
 
-static BUS_DEFINE_PROPERTY_GET_GLOBAL(property_get_pool_path, "s", "/var/lib/machines");
+static int property_get_pool_path(
+                sd_bus *bus,
+                const char *path,
+                const char *interface,
+                const char *property,
+                sd_bus_message *reply,
+                void *userdata,
+                sd_bus_error *error) {
+
+        Manager *m = userdata;
+        _cleanup_free_ char *pool_path = NULL;
+
+        assert(bus);
+        assert(reply);
+        assert(m);
+
+        pool_path = machines_path(m->is_system);
+        if (!pool_path)
+                return -ENOMEM;
+
+        return sd_bus_message_append(reply, "s", pool_path);
+}
 
 static int property_get_pool_usage(
                 sd_bus *bus,
@@ -43,13 +64,20 @@ static int property_get_pool_usage(
                 void *userdata,
                 sd_bus_error *error) {
 
+        Manager *m = userdata;
+        _cleanup_free_ char *pool_path = NULL;
         _cleanup_close_ int fd = -1;
         uint64_t usage = (uint64_t) -1;
 
         assert(bus);
         assert(reply);
+        assert(m);
 
-        fd = open("/var/lib/machines", O_RDONLY|O_CLOEXEC|O_DIRECTORY);
+        pool_path = machines_path(m->is_system);
+        if (!pool_path)
+                return -ENOMEM;
+
+        fd = open(pool_path, O_RDONLY|O_CLOEXEC|O_DIRECTORY);
         if (fd >= 0) {
                 BtrfsQuotaInfo q;
 
@@ -69,13 +97,18 @@ static int property_get_pool_limit(
                 void *userdata,
                 sd_bus_error *error) {
 
+        Manager *m = userdata;
+        _cleanup_free_ char *pool_path = NULL;
         _cleanup_close_ int fd = -1;
         uint64_t size = (uint64_t) -1;
 
         assert(bus);
         assert(reply);
+        assert(m);
 
-        fd = open("/var/lib/machines", O_RDONLY|O_CLOEXEC|O_DIRECTORY);
+        pool_path = machines_path(m->is_system);
+
+        fd = open(pool_path, O_RDONLY|O_CLOEXEC|O_DIRECTORY);
         if (fd >= 0) {
                 BtrfsQuotaInfo q;
 
@@ -124,7 +157,7 @@ static int method_get_image(sd_bus_message *message, void *userdata, sd_bus_erro
         if (r < 0)
                 return r;
 
-        r = image_find(IMAGE_MACHINE, name, NULL);
+        r = image_find(IMAGE_MACHINE, m->is_system, name, NULL);
         if (r == -ENOENT)
                 return sd_bus_error_setf(error, BUS_ERROR_NO_SUCH_IMAGE, "No image '%s' known", name);
         if (r < 0)
@@ -482,7 +515,7 @@ static int method_list_images(sd_bus_message *message, void *userdata, sd_bus_er
         if (!images)
                 return -ENOMEM;
 
-        r = image_discover(IMAGE_MACHINE, images);
+        r = image_discover(IMAGE_MACHINE, m->is_system, images);
         if (r < 0)
                 return r;
 
@@ -564,7 +597,7 @@ static int redirect_method_to_image(sd_bus_message *message, Manager *m, sd_bus_
         if (!image_name_is_valid(name))
                 return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Image name '%s' is invalid.", name);
 
-        r = image_find(IMAGE_MACHINE, name, &i);
+        r = image_find(IMAGE_MACHINE, m->is_system, name, &i);
         if (r == -ENOENT)
                 return sd_bus_error_setf(error, BUS_ERROR_NO_SUCH_IMAGE, "No image '%s' known", name);
         if (r < 0)
@@ -757,7 +790,7 @@ static int method_clean_pool(sd_bus_message *message, void *userdata, sd_bus_err
                         goto child_fail;
                 }
 
-                r = image_discover(IMAGE_MACHINE, images);
+                r = image_discover(IMAGE_MACHINE, m->is_system, images);
                 if (r < 0)
                         goto child_fail;
 
@@ -834,6 +867,7 @@ static int method_clean_pool(sd_bus_message *message, void *userdata, sd_bus_err
 
 static int method_set_pool_limit(sd_bus_message *message, void *userdata, sd_bus_error *error) {
         Manager *m = userdata;
+        _cleanup_free_ char *pool_path = NULL;
         uint64_t limit;
         int r;
 
@@ -860,13 +894,17 @@ static int method_set_pool_limit(sd_bus_message *message, void *userdata, sd_bus
                 return 1; /* Will call us back */
 
         /* Set up the machine directory if necessary */
-        r = setup_machine_directory(error);
+        r = setup_machine_directory(m->is_system, error);
         if (r < 0)
                 return r;
 
-        (void) btrfs_qgroup_set_limit("/var/lib/machines", 0, limit);
+        pool_path = machines_path(m->is_system);
+        if (!pool_path)
+                return -ENOMEM;
 
-        r = btrfs_subvol_set_subtree_quota_limit("/var/lib/machines", 0, limit);
+        (void) btrfs_qgroup_set_limit(pool_path, 0, limit);
+
+        r = btrfs_subvol_set_subtree_quota_limit(pool_path, 0, limit);
         if (r == -ENOTTY)
                 return sd_bus_error_setf(error, SD_BUS_ERROR_NOT_SUPPORTED, "Quota is only supported on btrfs.");
         if (r < 0)
