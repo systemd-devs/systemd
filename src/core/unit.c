@@ -1876,6 +1876,38 @@ static bool unit_verify_deps(Unit *u) {
         return true;
 }
 
+_pure_ static bool unit_is_blocked_by_slice(Unit *u, Unit **ret) {
+        assert(u);
+
+        while ((u = UNIT_GET_SLICE(u))) {
+                Slice *s = SLICE(u);
+
+                if (s->n_units >= s->n_max_units)
+                        break;
+        }
+
+        if (ret)
+                *ret = u;
+
+        return u;
+}
+
+static void unit_increment_slice_unit_count(Unit *u) {
+        assert(u);
+
+        while ((u = UNIT_GET_SLICE(u)))
+                SLICE(u)->n_units++;
+}
+
+static void unit_decrement_slice_unit_count(Unit *u) {
+        assert(u);
+
+        while ((u = UNIT_GET_SLICE(u))) {
+                assert(SLICE(u)->n_units > 0);
+                SLICE(u)->n_units--;
+        }
+}
+
 /* Errors that aren't really errors:
  *         -EALREADY:   Unit is already started.
  *         -ECOMM:      Condition failed
@@ -1890,10 +1922,11 @@ static bool unit_verify_deps(Unit *u) {
  *         -ENOLINK:    The necessary dependencies are not fulfilled.
  *         -ESTALE:     This unit has been started before and can't be started a second time
  *         -ENOENT:     This is a triggering unit and unit to trigger is not loaded
+ *         -E2BIG:      The max. number of units allowed by a parent slice is already running
  */
 int unit_start(Unit *u, ActivationDetails *details) {
         UnitActiveState state;
-        Unit *following;
+        Unit *following, *slice;
         int r;
 
         assert(u);
@@ -1949,6 +1982,9 @@ int unit_start(Unit *u, ActivationDetails *details) {
         if (!unit_verify_deps(u))
                 return -ENOLINK;
 
+        if (unit_is_blocked_by_slice(u, &slice))
+                return log_unit_info_errno(u, SYNTHETIC_ERRNO(E2BIG), "Allowed number of units is already running under slice %s.", slice->id);
+
         /* Forward to the main object, if we aren't it. */
         following = unit_following(u);
         if (following) {
@@ -1980,7 +2016,10 @@ int unit_start(Unit *u, ActivationDetails *details) {
         if (!u->activation_details) /* Older details object wins */
                 u->activation_details = activation_details_ref(details);
 
-        return UNIT_VTABLE(u)->start(u);
+        r = UNIT_VTABLE(u)->start(u);
+        if (r > 0)
+                unit_increment_slice_unit_count(u);
+        return r;
 }
 
 bool unit_can_start(Unit *u) {
@@ -2015,6 +2054,7 @@ bool unit_can_isolate(Unit *u) {
 int unit_stop(Unit *u) {
         UnitActiveState state;
         Unit *following;
+        int r;
 
         assert(u);
 
@@ -2037,7 +2077,10 @@ int unit_stop(Unit *u) {
 
         unit_add_to_dbus_queue(u);
 
-        return UNIT_VTABLE(u)->stop(u);
+        r = UNIT_VTABLE(u)->stop(u);
+        if (r > 0)
+                unit_decrement_slice_unit_count(u);
+        return r;
 }
 
 bool unit_can_stop(Unit *u) {
