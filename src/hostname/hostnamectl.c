@@ -66,6 +66,7 @@ typedef struct StatusInfo {
 } StatusInfo;
 
 static const char* chassis_string_to_glyph(const char *chassis) {
+        DISABLE_WARNING_POINTER_SIGN;
         if (streq_ptr(chassis, "laptop"))
                 return u8"💻"; /* Personal Computer */
         if (streq_ptr(chassis, "desktop"))
@@ -82,6 +83,7 @@ static const char* chassis_string_to_glyph(const char *chassis) {
                 return u8"🖴"; /* Hard disk */
         if (streq_ptr(chassis, "container"))
                 return u8"☐"; /* Ballot Box  */
+        REENABLE_WARNING;
         return NULL;
 }
 
